@@ -877,29 +877,66 @@ void Host_Init( ) {
 		Sbar_Init( );
 		CL_Init( );
 	}
-	LOC_Init( );
+	LOC_Init( ); /* For 2021 rerelease support */
 
+	Hunk_AllocName( 0, "-HOST_HUNKLEVEL-" );
+	host_hunklevel = Hunk_LowMark( );
 
+	host_initialized = true;
+	Con_Printf( "\n========== Quake Initialized ==========\n\n" );
+
+	if ( cls.state != ca_dedicated ) {
+		Cbuf_InsertText( "exec quake.rc\n" );
+		/*
+		 * johnfitz -- Incase the vidmode was locked during VID_Init(), we can unlock it now.
+		 * note: two leading newlines because the command buffer swallows one of them.
+ 		 */
+		Cbuf_AddText( "\n\nvid_unlock\n" );
+	}
+	if ( cls.state == ca_dedicated ) {
+		Cbuf_AddText( "exec autoexec.cfg\n" );
+		Cbuf_AddText( "stuffcmds" );
+		Cbuf_Execute( );
+		if ( !sv.active ) {
+			CBuf_AddText( "map start\n" );
+		}
+	}
 }
 
+/*
+===============
+Host_Shutdown
 
+FIXME: this is a callback from Sys_Quit and Sys_Error. It would be better
+to run quit through here first before the final handoff to the sys code
+===============
+*/
+void Host_Shutdown( void ) {
+	static qboolean		isdown = false;
 
+	if ( isdown ) {
+		printf( "recursive shutdown\n" );
+		return;
+	}
 
+	/* Keep Con_Printf from trying to update the screen */
+	scr_disabled_for_loading = true;
 
+	/* emes -- TODO: change this for -nomodify*/
+	Host_WriteConfiguration( );
 
+	Net_Shutdown( );
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+	if ( cls.state != ca_dedicated ) {
+		if ( con_initialized ) {
+			History_Shutdown( );
+		}
+		BGM_Shutdown( );
+		CDAudio_Shutdown( );
+		S_Shutdown( );
+		IN_Shutdown( );
+		VID_Shutdown( );
+	}
+	LOG_Close( );
+	LOC_Shutdown( );
+}
