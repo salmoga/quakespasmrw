@@ -1372,10 +1372,790 @@ void COM_Init() {
 		BigFloat = FloatNoSwap;
 		LittleFloat = FloatSwap;
 	}
-	else { /* Assumed little endian*/
-
+	else { /* Assumed little endian */
+		BigShort = ShortSwap;
+		LittleShort = ShortNoSwap;
+		BigLong = LongSwap;
+		LittleLong = LongNoSwap;
+		BigFloat = FloatSwap;
+		LittleFloat = FloatNoSwap;
+	}
+	if ( COM_CheckParm( "-fitz" ) ) {
+		fitzmode = true;
 	}
 }
+
+/*
+===============
+va
+
+does a varargs printf into a temp buffer. cycles between
+4 different static buffers. the number of buffers cycled
+is defined in VA_NUM_BUFS.
+FIXME: make this buffer size safe someday.
+===============
+*/
+#define VA_NUM_BUFFS	4
+#define VA_BUFFERLEN	1024
+
+static char *get_va_buffer( void ) {
+	static char va_buffers[VA_NUM_BUFFS][VA_BUFFERLEN];
+	static int buffer_idx = 0;
+
+	buffer_idx = ( buffer_idx + 1 ) & ( VA_NUM_BUFFS - 1 );
+	return va_buffers[buffer_idx];
+}
+
+char *va( const char *format, ... ) {
+	va_list		argptr;
+	char		*va_buf;
+
+	va_buf = get_va_buffer( );
+	va_start = ( argptr, format );
+	q_vsnprintf( va_buf, VA_BUFFERLEN, format, argptr );
+	va_end( argptr );
+
+	return va_buf;
+}
+
+/*
+================================================================================
+
+QUAKE FILESYSTEM
+
+================================================================================
+*/
+
+int com_filesize;
+
+/*
+ * On disk pakfile
+ */
+typedef struct {
+	char name[56];
+	int	filepos, filelen;
+} dpackfile_t;
+
+typedef struct {
+	char	id[4];
+	int	dirofs;
+	int	dirlen;
+} dpackheader_t;
+
+#define MAX_FILES_IN_PACK 2048
+
+char	com_gamedir[MAX_OSPATH];
+char	com_basedir[MAX_OSPATH];
+int	file_from_pack;		/* ZOID: Global indicating that a file came from a pack */
+
+searchpath_t *com_searchpaths;
+searchpath_t *com_base_searchpaths;
+
+/*
+===============
+COM_Path_f
+===============
+*/
+static void COM_Path_f( void ) {
+	searchpath_t *ss;
+
+	Con_Printf( "Current search path:\n" );
+	for ( ss = com_searchpaths; ss; ss = ss->next ) {
+		if ( ss->pack ) {
+			Con_Printf( "%s (%i files)\n", ss->pack->filename, ss->pack->numfiles );
+		}
+		else {
+			Con_Printf( "%s\n", ss->filename );
+		}
+	}
+}
+
+/*
+===============
+COM_WriteFile
+
+The filename will be prefixed by the current game directory
+===============
+*/
+void COM_WriteFile( const char *filename, const void *data, int len ) {
+	int	handle;
+	char	name[MAX_OSPATH];
+
+	/* johnfitz -- if we've switched to a nonexistant gamedir, create it now so we don't crash */
+	Sys_mkdir( com_gamedir );
+
+	q_snprintf( name, sizeof(name), "%s%s", com_gamedir, filename );
+
+	handle = Sys_FileOpenWrite( name );
+	if ( handle == -1 ) {
+		Sys_Printf( "COM_WriteFile(): Failed on %s\n", name );
+		return;
+	}
+
+	Sys_Printf( "Com_WriteFile(): %s\n", name );
+	Sys_FileWrite( handle, data, len );
+	Sys_FileClose( handle );
+}
+
+/*
+===============
+COM_CreatePath
+===============
+*/
+void COM_CreatePath( char *path ) {
+	char	*ofs;
+
+	for ( ofs = path + 1; *ofs; ofs++ ) {
+		if ( *ofs == '/') {
+			/* Create the directory */
+			*ofs = 0;
+			Sys_mkdir( path );
+			*ofs = '/'
+		}
+	}
+}
+
+/*
+===============
+COM_filelength
+===============
+*/
+void COM_filelength( FILE *ff ) {
+	long	pos, end;
+
+	pos = ftell( ff );
+	fseek( ff, 0, SEEK_END );
+	end = ftell( ff );
+	fseek( ff, pos, SEEK_SET );
+
+	return end;
+}
+
+/*
+===============
+COM_FindFile
+
+Finds the file in the search path.
+Sets com_filesize and either the handle or file.
+If neither the file or handle is set, this can be
+used for detecting a file's presence.
+===============
+*/
+static int COM_FindFile( const char *filename, int *handle, FILE **file, unsigned int *path_id ) {
+	searchpath_t	*search;
+	char		netpath[MAX_OSPATH];
+	pack_t		*pack;
+	int		ii;
+
+	if ( file && handle ) {
+		Sys_Error( "COM_FindFile(): both handle and file set" );
+	}
+
+	file_from_pack = 0;
+
+	/* Search through the path, one element at a time */
+	for ( search = com_searchpaths; search; search = search->next ) {
+		if ( search->pack ) { /* Look through all the pack file elements */
+			pack = search->pack;
+			for ( ii = 0; ii < pack->numfiles; ii++ ) {
+				if ( strcmp( pack->files[ii].name, filename ) != 0 ) {
+					continue;
+				}
+
+				/* Found it! */
+				com_filesize = pack->files[ii].filelen;
+				file_from_pack = 1;
+				if ( path_id ) {
+					*path_id = search->path_id;
+				}
+
+				if ( handle ) {
+					*handle = pack->handle;
+					Sys_FileSeek( pack->handle, pack->files[ii].filepos );
+					return com_filesize;
+				}
+				else if ( file ) {
+					/* Open a new file on the packfile */
+					*file = fopen( pack->filename, "rb" );
+					if ( *file ) {
+						fseek( *file, pack->files[ii].filepos, SEEK_SET );
+					}
+					return com_filesize;
+				}
+				else { /* For COM_FileExists() */
+					return com_filesize;
+				}
+			}
+		}
+		else { /* Check a file in the directory tree */
+			if ( !registered.value ) {
+				/* If not a registered version, don't ever go beyond base */
+				if ( strchr( filename, '/' ) || strchr( filename, '\\' ) ) {
+					continue;
+				}
+			}
+			q_snprintf( netpath, sizeof( netpath ), "%s%s", search->filename, filename );
+
+			if ( !( Sys_FileType( netpath ) & FS_ENT_FILE ) ) {
+				continue;
+			}
+
+			if ( path_id ) {
+				*path_id = search->path_id;
+			}
+			if ( handle ) {
+				com_filesize = Sys_FileOpenRead( netpath, &ii );
+				*handle = ii;
+				return com_filesize;
+			}
+			else if ( file ) {
+				*file = fopen( netpath, "rb" );
+				com_filesize = ( *file == NULL ) ? -1 : COM_filelength( *file );
+				return com_filesize;
+			}
+			else {
+				return 0; /* Dummy valid value for COM_FileExists */
+			}
+		}
+	}
+
+	if ( strcmp( COM_FileGetExtension( filename ), "pcx" ) != 0
+			&& strcmp( COM_FilenameGetExtension( filename ), "tga" ) != 0 
+			&& strcmp( COM_FilenameGetExtension( filename ), "lit" ) != 0
+			&& strcmp( COM_FilenameGetExtension( filename ), "vis" ) != 0
+			&& strcmp( COM_FilenameGetExtension( filename ), "ent" ) != 0) {
+		Con_DPrintf( "FindFile(): Can't find file %s\n", filename );
+	}
+	else {
+		Con_DPrintf2( "FindFile(): Can't find file %s\n", filename )
+	}
+
+	if ( handle ) {
+		*handle = -1;
+	}
+	if ( file ) {
+		*file = NULL;
+	}
+	com_filesize = -1;
+	return com_filesize;
+}
+
+/*
+===============
+COM_FileExists
+
+Returns whether the file is found in the quake filesystem
+===============
+*/
+qboolean COM_FileExists( const char *filename, unsigned int *path_id ) {
+	int ret = COM_FindFile( filename, NULL, NULL, path_id );
+	return ( ret == -1 ) ? false : true;
+}
+
+/*
+===============
+COM_OpenFile
+
+filename never has a leading slash, but may contain directory walks
+returns a handle and a length
+it may actually be inside a pack file
+===============
+*/
+int COM_OpenFile( const char *filename, int *handle, unsigned int *path_id ) {
+	return COM_FindFile( filename, handle, NULL, path_id );
+}
+
+/*
+===============
+COM_FOpenFile
+
+If the requested file is inside a packfile, a new FILE * will be opened
+into the file
+===============
+*/
+int COM_FOpenFile( const char *filename, FILE **file, unsigned int *path_id ) {
+	return COM_FindFile(filename, NULL, file, path_id);
+}
+
+/*
+===============
+COM_CloseFile
+
+If it is a pack file handle, don't really close it
+===============
+*/
+void COM_CloseFile( int hh ) {
+	searchpath_t *ss;
+
+	for ( ss = com_searchpaths; ss; ss = ss->next ) {
+		if ( ss->pack && ss->pack->handle == hh ) {
+			return;
+		}
+	}
+	Sys_FileClose( hh );
+}
+
+/*
+===============
+COM_LoadFile
+
+Filenames are relative to the quake directory.
+Always appends a 0 byte
+===============
+*/
+#define LOADFILE_ZONE		0
+#define LOADFILE_HUNK		1
+#define LOADFILE_TEMPHUNK	2
+#define LOADFILE_CACHE		3
+#define LOADFILE_STACK		4
+#define LOADFILE_MALLOC		5
+
+static byte		*loadbuf;
+static cache_user_t	*loadcache;
+static int		loadsize;
+
+byte *COM_LoadFile( const char *path, int usehunk, unsigned int *path_id ) {
+	int	hh;
+	byte	*buf;
+	char	base[32];
+	int	len, nread;
+
+	buf = NULL; /* Quiet compiler warning */
+
+	/* Look for it in the filesystem or pack files */
+	len = COM_OpenFile( path, &hh, path_id );
+	if ( hh = -1 ) {
+		return NULL;
+	}
+
+	/* Extract the filename base name for hunk tag */
+	COM_FileBase( path, base, sizeof( base ) );
+
+	switch ( usehunk ) {
+	case LOADFILE_HUNK:
+		buf = (byte *) Hunk_AllocName( len + 1, base );
+		break;
+	case LOADFILE_TEMPHUNK:
+		buf = (byte *) Hunk_TempAlloc( len + 1 );
+		break;
+	case LOADFILE_ZONE:
+		buf = (byte *) Z_Malloc( len + 1 );
+		break;
+	case LOADFILE_CACHE:
+		buf = (byte *) Cache_Alloc( loadcache, len + 1, base );
+		break;
+	case LOADFILE_STACK:
+			if ( len < loadsize ) {
+				buf = loadbuf;
+			}
+			else {
+				buf = (byte *) Hunk_TempAlloc( len + 1 );
+			}
+		break;
+	case LOADFILE_MALLOC:
+		buf = (byte *) malloc( len + 1 );
+		break;
+	default:
+		Sys_Error( "COM_LoadFile(): Bad usehunk" );
+	}
+
+	if ( !buf ) {
+		Sys_Error( "COM_LoadFile(): Not Enough Space for %s", path );
+	}
+	( (byte *)buf )[len] = 0;
+
+	nread = Sys_FileRead( hh, buf, len );
+
+	COM_CloseFile( hh );
+
+	if ( nread != len ){
+		Sys_Error( "COM_LoadFile(): Error Reading %s", path );
+	}
+	return buf;
+}
+
+byte *COM_LoadHunkFile( const char *path, unsigned int *path_id ) {
+	return COM_LoadFile( path, LOADFILE_HUNK, path_id );
+}
+
+byte *COM_LoadZoneFIle( const char *path, unsigned int *path_id ) {
+	return COM_LoadFile(path, LOADFILE_ZONE, path_id);
+}
+
+byte *COM_LoadTempFile( const char *path, unsigned int *path_id ) {
+	return COM_LoadFile(path, LOADFILE_TEMPHUNK, path_id );
+}
+
+byte *COM_LoadCacheFile( const char *path, struct cache_user_s *cu, unsigned int *path_id ) {
+	loadcache = cu;
+	return COM_LoadFile(path, LOADFILE_CACHE, path_id)
+}
+
+/* Uses Temp Hunk if larger than bufsize */
+byte *COM_LoadStackFile( const char *path, void *buffer, int bufsize, unsigned int *path_id ) {
+	byte *buf;
+
+	loadbuf = (byte *)buffer;
+	loadsize = bufsize;
+	buf = COM_LoadFile( path, LOADFILE_STACK, path_id );
+
+	return buf;
+}
+
+/* Returns Malloc'd memory */
+byte *COM_LoadMallocFile( const char *path, unsigned int *path_id ) {
+	return COM_LoadFile( path, LOADFILE_MALLOC, path_id );
+}
+
+byte *COM_LoadMallocFile_TextMode_OSPath( const char *path, long *len_out ) {
+	FILE	*ff;
+	byte	*data;
+	long	len, actuallen;
+
+	/*
+	 * ericw -- this is used by Host_Loadgame_f. Translate CRLF to LF on load games,
+	 * otherwise multiline messages have a garbage character at the end of each line.
+	 * TODO: Could handle in a way that allows loading CRLF savegames on mac/linux
+	 * without the junk characters appearing.
+	 */
+	ff = fopen( path, "rt" );
+	if ( ff == NULL ) {
+		return NULL;
+	}
+
+	len = COM_filelength( ff );
+	if ( len < 0 ) {
+		fclose( ff );
+		return NULL;
+	}
+
+	data = (byte *) malloc( len + 1 );
+	if ( data == NULL ) {
+		fclose( ff );
+		return NULL;
+	}
+
+	/* ( actuallen < len ) if CRLF to LF translation was performed */
+	actuallen = fread( data, 1, len, ff );
+	if ( ferror( ff ) ) {
+		fclose( ff );
+		free( data );
+		return NULL;
+	}
+	data[actuallen] = '\0';
+
+	if ( len_out != NULL ) {
+		*len_out = actuallen;
+	}
+	fclose( ff );
+	return data;
+}
+
+const char *COM_ParseIntNewline( const char *buffer, int *value ) {
+	int consumed = 0;
+	sscanf( buffer, "%i\n%n", value, &consumed );
+	return buffer + consumed;
+}
+
+const char *COM_ParseFloatNewline( const char *buffer, float *value ) {
+	int consumed = 0;
+	sscanf( buffer, "%f\n%n", value, &consumed );
+	return buffer + consumed;
+}
+
+const char *COM_ParseStringNewline( const char *buffer ) {
+	int consumed = 0;
+	com_token[0] = '\0';
+	sscanf( buffer, "%1023s\n%n", com_token, &consumed );
+	return buffer + consumed;
+}
+
+/*
+===============
+COM_LoadPackFile -- johnfitz -- modified based on topaz's tutorial
+
+Takes an explicit (not game tree related) path to a pack file.
+
+Loads the header and directory, adding the files at the begining
+of the list so they override previous pack files
+===============
+*/
+static pack_t COM_LoadPackFile( const char *packfile ) {
+	dpackheader_t	header;
+	int		ii;
+	packfile_t	*newfiles;
+	int		numpackfiles;
+	pack_t		*pack;
+	int		packhandle;
+	dpackfile_t	info[MAX_FILES_IN_PACK];
+	unsigned short	crc;
+
+	if ( Sys_FileOpenRead( packfile, &packhandle ) == -1 ) {
+		return -1;
+	}
+	if ( Sys_FileRead( packhandle, &header, sizeof(header) ) != (int) sizeof( header ) ||
+			header.id[0] != 'P' ||
+			header.id[1] != 'A' ||
+			header.id[2] != 'C' ||
+			header.id[3] != 'K' ) {
+		Sys_Error( "%s is not a packfile.", packfile );
+	}
+
+	header.dirofs = LittleLong( header.dirofs );
+	header.dirlen = LittleLong( header.dirlen );
+
+	numpackfiles = header.dirlen / sizeof( dpackfile_t );
+
+	if ( header.dirlen < 0 || header.dirofs < 0 ) {
+		Sys_Error( "Invalid Packfile %s (dirlen %i dirofs %i)",
+			packfile, header.dirlen, header.dirofs );
+	}
+	if ( !numpackfiles ) {
+		Sys_Printf( "WARNING: %s has no files, ignored.", packfile );
+		Sys_FileClose( packhandle );
+		return NULL;
+	}
+	if ( numpackfiles > MAX_FILES_IN_PACK ) {
+		Sys_Error( "%s has %i files, more than %i max.", packfile, numpackfiles, MAX_FILES_IN_PACK );
+	}
+	if ( numpackfiles != PAK0_COUNT ) {
+		/* TODO: change this for librequake */
+		com_modified = true; /* Not the original file */
+	}
+
+	newfiles = (packfile_t *) Z_Malloc( numpackfiles * sizeof( packfile_t) );
+
+	Sys_FileSeek( packhandle, header.dirofs );
+	if ( Sys_FileRead( packhandle, info, header.dirlen ) != header.dirlen ) {
+		Sys_Error( "Error reading %s", packfile );
+	}
+
+	/* CRC the directory to check for modifications */
+	/* TODO: change for librequake */
+	CRC_Init( &crc );
+	for ( ii = 0; ii < header.dirlen; ii++ ) {
+		CRC_ProcessByte( &crc, ( (byte *)info )[ii] );
+	}
+	if ( crc != PAK_CRC_V106 && crc != PAK_CRC_V101 && crc != PAK_CRC_V100 )
+		com_modified = true;
+
+	/* Parse the directory */
+	for ( ii = 0; ii < numpackfiles; ii++ ) {
+		q_strlcpy( newfiles[ii].name, info[ii].name, sizeof( newfiles[ii].name ) );
+		newfiles[ii].filepos = LittleLong( info[ii].filepos );
+		newfiles[ii].filelen = LittleLong( info[ii].filelen );
+	}
+
+	pack = (pack_t *) Z_Malloc( sizeof( pack_t ) );
+	q_strlcpy( pack->filename, packfile, sizeof( pack->filename ) );
+	pack->handle = packhandle;
+	pack->numfiles = numpackfiles;
+	pack->files = newfiles;
+
+	Sys_Printf( "Added packfile %s (%i files)\n", packfile, numpackfiles );
+	return pack;
+}
+
+/*
+===============
+COM_AddGameDirectory -- johnfitz -- modified based on topaz's tutorial
+===============
+*/
+static void COM_AddGameDirectory( const char *base, const char *dir ) {
+	int		ii;
+	unsigned int	path_id;
+	searchpath_t	*search;
+	pack_t		*pack, qspack;
+	char		packfile[MAX_OSPATH];
+	qboolean	been_here = false;
+
+	q_strlcpy( com_gamedir, va( "%s%s", base, dir ), sizeof( com_gamedir ) );
+
+	/* Assign a path_id to this game directory */
+	if ( com_searchpaths ) {
+		path_id = com_searchpaths->path_id << 1;
+	}
+	else {
+		path_id = 1U;
+	}
+
+_add_path:
+	/* Add the directory to the search path */
+	search = (searchpath_t *) Z_Malloc( sizeof( searchpath_t ) );
+	search->path_id = path_id;
+	q_strlcpy( search->filename, com_gamedir, sizeof( search->filename ) );
+	search->next = com_searchpaths;
+	com_searchpaths = search;
+
+	/* Add any pack files in the format pak0.pak, pak1.pak, ... */
+	for ( ii = 0; ; ii++ ) {
+		q_snprintf( packfile, sizeof( packfile ), "%s/pak%i.pak", com_gamedir, ii );
+		pack = COM_LoadPackFile( packfile );
+		if ( ii != 0 || path_id != 1 || fitzmode ) {
+			qspack = NULL;
+		}
+		else {
+			qboolean old = com_modified;
+			if ( been_here ) {
+				base = host_parms->userdir;
+			}
+			q_snprintf( packfile, sizeof( packfile ), "%s/quakespasm.pak", base );
+			qspack = COM_LoadPackFile( packfile );
+			com_modified = old;
+		}
+		if ( pack ) {
+			search = ( searchpath_t *) Z_Malloc( sizeof( sizeof( searchpath_t ) ) );
+			search->path_id = path_id;
+			search->pack = pack;
+			search->next = com_searchpaths;
+			com_searchpaths = search;
+		}
+		if ( qspack ) {
+			search = ( searchpath_t *) Z_Malloc( sizeof( searchpath_t ) );
+			search->path_id = path_id;
+			search->pack = qspack;
+			search->next = com_searchpaths;
+			com_searchpaths = search;
+		}
+		if ( !pack ) {
+			break;
+		}
+	}
+	if ( !been_here && host_params->userdir != host_parms->basedir ) {
+		been_here = true;
+		q_strlcpy( com_gamedir, va( "%s/%s", host_parms->userdir, dir ), sizeof( com_gamedir ) );
+		Sys_mkdir( com_gamedir );
+		goto _add_path;
+	}
+}
+
+/*
+================================================================================
+johnfitz -- dynamic gamedir stuff - modified by QuakeSpasm team.
+================================================================================
+*/
+static void COM_Game_f( void ) {
+	if ( Cmd_Argc( ) > 1 ) {
+		const char *p1 = Cmd_Argv( 1 );
+		const char *p2 = Cmd_Argv( 2 );
+		searchpath_t *search;
+
+		if ( !registered.value ) {
+			Con_Printf( "You must have the registered version to use modified games.\n" );
+			return;
+		}
+		if ( !*p1 ||
+				!strcmp( p1, "." ) ||
+			 	strstr( p1, ".." ) ||
+			 	strstr( p1, "/" ) ||
+			 	strstr( p1, "\\" ) ||
+			 	strstr( p1, ":" ) ) {
+			Con_Printf( "gamedir should be a single directory name, not a path\n" );
+			return;
+		}
+
+		if ( !*p2 ) {
+			if ( strcmp( p2, "-hipnotic" ) && strcmp( p2, "-rogue" ) && strcmp( p2, "-quoth" ) ) {
+				Con_Printf( "Invalid mission pack argument to \"game\".\n" );
+				return;
+			}
+			if ( !q_strcasecmp( p1, GAMENAME ) ) {
+				Con_Printf( "No mission pack arguments to %s game.\n", GAMENAME );
+				return;
+			}
+		}
+
+		if ( !q_strcasecmp( p1, COM_SkipPath( com_gamedir ) ) ) { /* No Change */
+			if ( com_searchpaths->path_id > 1 ) { /* Current game not id1 */
+				if ( *p2 && com_searchpaths->path_id == 2 ) {
+					/*
+					 * rely on Quakespasm extension treating "-game missionpack"
+					 * as "-missionpack", otherwise would be a mess
+					 */
+					if ( !q_strcasecmp( p1, &p2[1] ) ) {
+						goto _same;
+					}
+					Con_Printf( "Reloading game \"%s\" with \"%s\" support", p1, &p2[1] );
+				}
+				else if ( !*p2 && com_searchpaths->path_id > 2 ) {
+					Con_Printf( "Reloading game \"%s\" without mission pack support\n", p1 );
+				}
+				else {
+					goto _same;
+				}
+			}
+			else {
+			_same:
+				Con_Printf( "\"game\" is already \"%s\"\n", COM_SkipPath( com_gamedir ) );
+				return;
+			}
+		}
+
+		com_modified = true;
+
+		/* End the Server */
+		CL_Disconnect( );
+		Host_ShutdownServer( true );
+
+		/* Write config file */
+		Host_WriteConfiguration( );
+
+		/* End the extra game if it is loaded */
+		while ( com_searchpaths != com_base_searchpaths ) {
+			if ( com_searchpaths->paths ) {
+				Sys_FileClose( com_searchpaths->pack->files );
+				Z_Free( com_searchpaths->pack->files );
+				Z_Free( com_searchpaths->pack );
+			}
+			search = com_searchpaths->next;
+			Z_Free( com_searchpaths );
+			com_searchpaths = search;
+		}
+		hipnotic = false;
+		rogue = false;
+		standard_quake = true;
+
+		if ( q_strcasecmp( p1, GAMENAME ) ) { /* game is not id1 */
+			if ( *p2 ) {
+				COM_AddGameDirectory( com_basedir, &p2[1] );
+				standard_quake = false;
+				if ( !strcmp( p2, "-hipnotic" ) || !strcmp( p2, "-quoth" ) ) {
+					hipnotic = true;
+				}
+				else if ( !strcmp( p2, "-rogue" ) ) {
+					rogue = true;
+				}
+				if ( q_strcasecmp( p1, &p2[1]) ) { /* Don't load twice */
+					COM_AddGameDirectory( com_basedir, p1 );
+				}
+			}
+			else {
+				COM_AddGameDirectory( com_basedir, p1 );
+				/* Quakespasm extension: treat "-game missionpack" as "-missionpack" */
+				if ( !q_strcasecmp( p1, "hipnotic" ) || !q_strcasecmp( p1, "quoth" ) ) {
+					hipnotic = true;
+					standard_quake = false;
+				}
+				else if ( !q_strcasecmp( p1, "rogue" ) ) {
+					rogue = true;
+					standard_quake = false;
+				}
+			}
+		}
+		else { /* Just update com_gamedir */
+			
+		}
+	}
+}
+
+
+
+
+
+
+
+
+
 
 
 
